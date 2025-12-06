@@ -10,6 +10,7 @@ import traceback
 import logging
 import subprocess
 import shlex
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,10 @@ ALLOWED_EXTENSIONS = {"mp3", "wav", "ogg", "m4a", "flac"}
 whisper_model = None
 translation_models = {}  # cache: key -> (model, tokenizer)
 
+# Set device for faster processing
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {device}")
+
 def allowed_file(filename):
     """Check if file extension is allowed"""
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -39,9 +44,9 @@ def load_whisper_model():
     global whisper_model
     try:
         logger.info("Loading Whisper model (base)...")
-        # small/ base tradeoff: "base" is decent; change to "small" if you want better accuracy (bigger)
-        whisper_model = whisper.load_model("small")
-        logger.info("Whisper model loaded successfully")
+        # Use base model for faster processing (change to 'small' for better accuracy)
+        whisper_model = whisper.load_model("base", device=device)
+        logger.info(f"Whisper model loaded successfully on {device}")
     except Exception as e:
         logger.error(f"Failed to load Whisper model: {str(e)}")
         raise
@@ -50,36 +55,32 @@ def get_translation_model(source_lang, target_lang):
     """
     Load translation model with fallback logic.
     Returns (model, tokenizer) tuple.
-    Only en<->hi currently uses actual Helsinki models.
-    Bengali/Odia are kept as placeholders (not implemented) to keep repo small.
     """
     global translation_models
     model_key = f"{source_lang}-{target_lang}"
     if model_key in translation_models:
         return translation_models[model_key]
 
-    # Keep only the pairs we care about (en <-> hi). Others not implemented for now.
     model_mappings = {
         "en-hi": "Helsinki-NLP/opus-mt-en-hi",
         "hi-en": "Helsinki-NLP/opus-mt-hi-en",
-        # Bengali/Odia placeholder entries (not downloaded by default)
-        # "en-bn": "Helsinki-NLP/opus-mt-en-bn",  # <- not added to avoid unexpected downloads
-        # "bn-en": "Helsinki-NLP/opus-mt-bn-en",
-        # "en-od": "some-en-od-model",
-        # "od-en": "some-od-en-model",
     }
 
     model_name = model_mappings.get(model_key)
     if not model_name:
-        # Not implemented for bn/od or other languages - return helpful error
         raise ValueError(f"Translation model not available for {source_lang} -> {target_lang}")
 
     try:
         logger.info(f"Loading translation model: {model_name}")
         tokenizer = MarianTokenizer.from_pretrained(model_name)
         model = MarianMTModel.from_pretrained(model_name)
+        
+        # Move model to GPU if available
+        if device == "cuda":
+            model = model.to(device)
+        
         translation_models[model_key] = (model, tokenizer)
-        logger.info(f"Translation model loaded: {model_name}")
+        logger.info(f"Translation model loaded: {model_name} on {device}")
         return model, tokenizer
     except Exception as e:
         logger.error(f"Failed to load translation model {model_name}: {str(e)}")
@@ -87,14 +88,27 @@ def get_translation_model(source_lang, target_lang):
 
 def transcribe_audio(filepath, language=None):
     """
-    Transcribe audio file using Whisper (returns recognized text, romanized/dependent on model)
+    Transcribe audio file using Whisper
     """
     try:
         logger.info(f"Transcribing audio: {filepath}")
+        # Use fp16 for faster inference on GPU
+        fp16 = device == "cuda"
+        
         if language:
-            result = whisper_model.transcribe(filepath, language=language, task="transcribe")
+            result = whisper_model.transcribe(
+                filepath, 
+                language=language, 
+                task="transcribe",
+                fp16=fp16
+            )
         else:
-            result = whisper_model.transcribe(filepath, task="transcribe")
+            result = whisper_model.transcribe(
+                filepath, 
+                task="transcribe",
+                fp16=fp16
+            )
+        
         recognized_text = result.get("text", "").strip()
         detected_lang = result.get("language", "unknown")
         logger.info(f"Transcription complete. Detected language: {detected_lang}")
@@ -110,8 +124,24 @@ def translate_text(text, source_lang, target_lang):
     try:
         logger.info(f"Translating text: {source_lang} -> {target_lang}")
         model, tokenizer = get_translation_model(source_lang, target_lang)
-        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        translated = model.generate(**inputs)
+        
+        # Prepare inputs
+        inputs = tokenizer(
+            text, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=512
+        )
+        
+        # Move inputs to device
+        if device == "cuda":
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # Generate translation
+        with torch.no_grad():  # Disable gradient calculation for faster inference
+            translated = model.generate(**inputs)
+        
         translated_text = tokenizer.decode(translated[0], skip_special_tokens=True)
         logger.info("Translation complete")
         return translated_text
@@ -121,21 +151,21 @@ def translate_text(text, source_lang, target_lang):
 
 def generate_speech(text, lang, output_path):
     """
-    Generate speech using gTTS. If language unsupported, fallback to English.
+    Generate speech using gTTS
     """
     try:
         logger.info(f"Generating speech for language: {lang}")
         gtts_lang_map = {
-            "hi": "hi",   # Hindi
-            "en": "en",   # English
-            "bn": "bn",   # Bengali (gTTS supports 'bn' in many setups)
-            # Odia not supported by gTTS - fallback to Hindi/English as appropriate
+            "hi": "hi",
+            "en": "en",
+            "bn": "bn",
             "od": None,
         }
         gtts_lang = gtts_lang_map.get(lang, "en")
         if gtts_lang is None:
-            logger.warning(f"gTTS does not support '{lang}'. Falling back to English for TTS.")
+            logger.warning(f"gTTS does not support '{lang}'. Falling back to English.")
             gtts_lang = "en"
+        
         tts = gTTS(text=text, lang=gtts_lang, slow=False)
         tts.save(output_path)
         logger.info(f"Speech generated: {output_path}")
@@ -146,25 +176,58 @@ def generate_speech(text, lang, output_path):
 
 def convert_to_wav_mono_16k(src_path):
     """
-    Convert any audio file to 16kHz mono WAV using ffmpeg, if ffmpeg is available.
-    Returns path to converted wav file (or original path on failure).
+    Convert audio to 16kHz mono WAV using ffmpeg
     """
     base = os.path.splitext(os.path.basename(src_path))[0]
     out_path = os.path.join(UPLOAD_FOLDER, f"{base}_16k_mono.wav")
-    cmd = f'ffmpeg -y -i "{src_path}" -ac 1 -ar 16000 "{out_path}"'
+    
+    # Faster conversion with reduced quality checks
+    cmd = f'ffmpeg -y -i "{src_path}" -ac 1 -ar 16000 -acodec pcm_s16le "{out_path}"'
     try:
-        subprocess.run(shlex.split(cmd), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            shlex.split(cmd), 
+            check=True, 
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30  # Timeout after 30 seconds
+        )
         logger.info(f"Converted audio to 16k mono WAV: {out_path}")
         return out_path
-    except Exception as e:
-        logger.warning(f"FFmpeg conversion failed or not available, using original file. Error: {e}")
+    except subprocess.TimeoutExpired:
+        logger.warning(f"FFmpeg conversion timed out, using original file")
         return src_path
+    except Exception as e:
+        logger.warning(f"FFmpeg conversion failed, using original file. Error: {e}")
+        return src_path
+
+def cleanup_old_files():
+    """
+    Clean up old files (older than 1 hour) in background
+    """
+    def cleanup():
+        import time
+        current_time = time.time()
+        for folder in [UPLOAD_FOLDER, GENERATED_AUDIO_FOLDER]:
+            try:
+                for filename in os.listdir(folder):
+                    filepath = os.path.join(folder, filename)
+                    if os.path.isfile(filepath):
+                        file_age = current_time - os.path.getmtime(filepath)
+                        if file_age > 3600:  # 1 hour
+                            os.remove(filepath)
+                            logger.info(f"Cleaned up old file: {filepath}")
+            except Exception as e:
+                logger.error(f"Cleanup error in {folder}: {e}")
+    
+    thread = threading.Thread(target=cleanup, daemon=True)
+    thread.start()
 
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint"""
     return jsonify({
         "status": "ok",
+        "device": device,
         "whisper_loaded": whisper_model is not None,
         "translation_models_cached": list(translation_models.keys()),
         "timestamp": datetime.now().isoformat()
@@ -174,12 +237,10 @@ def health():
 def translate():
     """
     Main translation endpoint
-    Expected form-data:
-      - file: audio file (mp3/wav/ogg/m4a/flac)
-      - input_lang: source language code (e.g., 'en', 'hi', 'bn', 'od')
-      - target_lang: target language code (e.g., 'hi', 'en', 'bn', 'od')
     """
     try:
+        start_time = datetime.now()
+        
         # Validate file upload
         if "file" not in request.files:
             return jsonify({"error": "No audio file provided"}), 400
@@ -203,22 +264,33 @@ def translate():
         file.save(upload_filepath)
         logger.info(f"File uploaded: {filename}")
 
-        # Preprocess audio (16k mono wav) to improve ASR
+        # Preprocess audio
         processed_audio = convert_to_wav_mono_16k(upload_filepath)
 
         recognized_text = ""
         translated_text = ""
 
-        # Use Whisper direct translate for hi -> en (end-to-end), which often performs better
+        # Use Whisper direct translate for hi -> en
         if input_lang == "hi" and target_lang == "en":
             try:
                 logger.info("Using Whisper end-to-end translate for hi->en")
-                # End-to-end translation (Hindi audio -> English text)
-                whisper_result = whisper_model.transcribe(processed_audio, language="hi", task="translate")
+                fp16 = device == "cuda"
+                whisper_result = whisper_model.transcribe(
+                    processed_audio, 
+                    language="hi", 
+                    task="translate",
+                    fp16=fp16
+                )
                 translated_text = whisper_result.get("text", "").strip()
-                # For recognized_text, also get Hindi transcription (romanized) if you want
+                
+                # Get Hindi transcription
                 try:
-                    raw_trans = whisper_model.transcribe(processed_audio, language="hi", task="transcribe")
+                    raw_trans = whisper_model.transcribe(
+                        processed_audio, 
+                        language="hi", 
+                        task="transcribe",
+                        fp16=fp16
+                    )
                     recognized_text = raw_trans.get("text", "").strip()
                 except Exception:
                     recognized_text = ""
@@ -226,7 +298,7 @@ def translate():
                 logger.error(f"Whisper translate failed: {e}")
                 return jsonify({"error": f"Whisper translate failed: {str(e)}"}), 500
         else:
-            # Default flow: transcribe first, then translate (e.g., en->hi)
+            # Default flow: transcribe then translate
             try:
                 recognized_text = transcribe_audio(processed_audio, language=input_lang)
             except Exception as e:
@@ -235,7 +307,6 @@ def translate():
             if not recognized_text:
                 return jsonify({"error": "No speech detected in audio"}), 400
 
-            # For bn/od translation we currently return a helpful error (not implemented)
             try:
                 translated_text = translate_text(recognized_text, input_lang, target_lang)
             except ValueError as e:
@@ -243,7 +314,7 @@ def translate():
             except Exception as e:
                 return jsonify({"error": f"Translation failed: {str(e)}"}), 500
 
-        # Generate TTS of translated text
+        # Generate TTS
         output_filename = f"{timestamp}_output.mp3"
         output_filepath = os.path.join(GENERATED_AUDIO_FOLDER, output_filename)
         try:
@@ -251,13 +322,20 @@ def translate():
         except Exception as e:
             return jsonify({"error": f"TTS generation failed: {str(e)}"}), 500
 
-        # Optional cleanup - keep or remove uploaded originals as you prefer
+        # Cleanup uploaded file
         try:
             if os.path.exists(upload_filepath):
                 os.remove(upload_filepath)
-                logger.info(f"Cleaned up upload: {upload_filepath}")
+            if processed_audio != upload_filepath and os.path.exists(processed_audio):
+                os.remove(processed_audio)
         except Exception as e:
-            logger.warning(f"Failed to clean up upload: {str(e)}")
+            logger.warning(f"Failed to clean up files: {str(e)}")
+
+        # Schedule background cleanup of old files
+        cleanup_old_files()
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Total processing time: {processing_time:.2f} seconds")
 
         audio_url = f"/audio/{output_filename}"
         response = {
@@ -266,9 +344,9 @@ def translate():
             "audio_url": audio_url,
             "source_language": input_lang,
             "target_language": target_lang,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "processing_time_seconds": round(processing_time, 2)
         }
-        logger.info("Translation request completed successfully")
         return jsonify(response), 200
 
     except Exception as e:
@@ -282,17 +360,19 @@ def serve_audio(filename):
         filepath = os.path.join(GENERATED_AUDIO_FOLDER, filename)
         if not os.path.exists(filepath):
             return jsonify({"error": "Audio file not found"}), 404
-        return send_file(filepath, mimetype="audio/mpeg", as_attachment=False, download_name=filename)
+        return send_file(
+            filepath, 
+            mimetype="audio/mpeg", 
+            as_attachment=False, 
+            download_name=filename
+        )
     except Exception as e:
         logger.error(f"Error serving audio: {str(e)}")
         return jsonify({"error": "Failed to serve audio file"}), 500
 
 @app.route("/languages", methods=["GET"])
 def get_supported_languages():
-    """
-    Return list of supported language pairs (kept minimal: en, hi, bn, od)
-    Note: translation models implemented currently only for en<->hi.
-    """
+    """Return list of supported language pairs"""
     supported_pairs = [
         {"source": "en", "target": "hi", "name": "English to Hindi"},
         {"source": "hi", "target": "en", "name": "Hindi to English"},
@@ -306,13 +386,15 @@ def get_supported_languages():
 if __name__ == "__main__":
     # Load Whisper model at startup
     load_whisper_model()
-    # NOTE: translation models are loaded lazily when first requested to save startup time & disk.
-    # If you prefer to preload en<->hi at startup, uncomment below:
-    # try:
-    #     get_translation_model("en", "hi")
-    #     get_translation_model("hi", "en")
-    # except Exception as e:
-    #     logger.warning(f"Preloading translation models failed or skipped: {e}")
+    
+    # Preload translation models for better first-request performance
+    try:
+        logger.info("Preloading translation models...")
+        get_translation_model("en", "hi")
+        get_translation_model("hi", "en")
+        logger.info("Translation models preloaded successfully")
+    except Exception as e:
+        logger.warning(f"Preloading translation models failed: {e}")
 
-    # Run Flask app
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    # Run Flask app with production settings
+    app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
