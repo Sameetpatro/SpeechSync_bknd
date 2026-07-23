@@ -1,0 +1,27 @@
+# SpeechSync unified backend
+# Target: single ~48GB GPU (CUDA). Falls back to CPU automatically.
+
+Flask==3.0.3
+werkzeug==3.0.3
+
+# Core ML
+torch==2.3.1
+transformers==4.44.2
+accelerate==0.33.0
+sentencepiece==0.2.0
+protobuf==4.25.3
+
+# Translation (IndicTrans2)
+IndicTransToolkit==1.1.1
+
+# TTS
+gTTS==2.5.3
+indic-transliteration==2.3.60
+
+# Audio I/O
+soundfile==0.12.1
+numpy==1.26.4
+
+# NOTE: ffmpeg must be installed at the system level, e.g.
+#   Ubuntu/Debian:  sudo apt-get install -y ffmpeg
+#   macOS (brew):   brew install ffmpeg
