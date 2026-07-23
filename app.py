@@ -68,12 +68,62 @@ os.makedirs(GENERATED_AUDIO_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {"mp3", "wav", "ogg", "m4a", "flac"}
 
+# Keep at most this many files in each on-disk queue (FIFO: oldest deleted first).
+# Final audio is meant to live on the user's device; the server only holds a short buffer.
+MAX_QUEUED_FILES = 20
+
+
 # ----------------------------------------------------------------------
 # Device
 # ----------------------------------------------------------------------
 device = "cuda" if torch.cuda.is_available() else "cpu"
 TORCH_DTYPE = torch.float16 if device == "cuda" else torch.float32
 logger.info(f"Using device: {device}")
+
+
+# ----------------------------------------------------------------------
+# Disk queue cleaner (FIFO, max MAX_QUEUED_FILES)
+# ----------------------------------------------------------------------
+_disk_lock = threading.Lock()
+
+
+def _list_files(folder):
+    if not os.path.isdir(folder):
+        return []
+    return [
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if os.path.isfile(os.path.join(folder, name))
+    ]
+
+
+def enforce_file_queue(folder, max_files=MAX_QUEUED_FILES):
+    """Delete oldest files until ``folder`` has at most ``max_files`` entries."""
+    with _disk_lock:
+        files = _list_files(folder)
+        if len(files) <= max_files:
+            return
+
+        files.sort(key=lambda p: os.path.getmtime(p))  # oldest first
+        overflow = len(files) - max_files
+        for path in files[:overflow]:
+            try:
+                os.remove(path)
+                logger.info(f"Disk queue: deleted {os.path.basename(path)}")
+            except OSError as exc:
+                logger.warning(f"Disk queue: could not delete {path}: {exc}")
+
+
+def safe_remove(*paths):
+    for path in paths:
+        if not path:
+            continue
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
 
 # ----------------------------------------------------------------------
 # Language maps
@@ -541,6 +591,7 @@ def translate_api():
             UPLOAD_FOLDER, f"{stamp}_{secure_filename(file.filename)}"
         )
         file.save(upload)
+        enforce_file_queue(UPLOAD_FOLDER)
 
         audio = convert_to_wav_mono_16k(upload)
         recognized = transcribe(audio, asr_choice)
@@ -548,6 +599,14 @@ def translate_api():
 
         out_base = os.path.join(GENERATED_AUDIO_FOLDER, f"{stamp}_out")
         out_audio = synthesize(translated, tgt, tts_choice, out_base)
+
+        # Uploads are ephemeral — final audio is for the client device.
+        # Drop the source + ffmpeg temp immediately; keep only a short TTS queue.
+        if audio != upload:
+            safe_remove(audio)
+        safe_remove(upload)
+        enforce_file_queue(UPLOAD_FOLDER)
+        enforce_file_queue(GENERATED_AUDIO_FOLDER)
 
         return jsonify(
             {
